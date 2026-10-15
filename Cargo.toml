@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: 2026 roolrz
+# SPDX-License-Identifier: Apache-2.0
+[package]
+workspace = "../../app"
+name = "hyper-fs-fat-system"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+autotests = false
+[[bin]]
+name = "hyper-fs-fat-system"
+path = "src/main.rs"
+test = false
+bench = false
+[dependencies]
+hyper-os = { workspace = true, features = ["std"] }
+hyper-rt.workspace = true
+hyper-service.workspace = true
+hyper-filesystem.workspace = true
+hyper-fs-service.workspace = true
+fatfs = { path = "../../third_party/rust-fatfs", default-features = false, features = ["lfn", "unicode"] }
+
+[lints]
+workspace = true
+
+[lib]
+name = "hyper_fs_fat"
