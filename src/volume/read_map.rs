@@ -96,6 +96,33 @@ impl Cache {
 }
 
 impl Map {
+    pub(super) fn plan(
+        &self,
+        offset: u64,
+        requested: usize,
+        output: &mut hyper_filesystem::protocol::ReadExtentPlanBuilder<'_>,
+    ) -> Result<(), Error> {
+        let count = requested.min(self.size.saturating_sub(offset) as usize);
+        let first = self
+            .extents
+            .partition_point(|extent| extent.logical + extent.length <= offset);
+        for extent in &self.extents[first..] {
+            let done = output.length();
+            if done == count {
+                break;
+            }
+            let relative = offset + done as u64 - extent.logical;
+            let length = (count - done).min((extent.length - relative) as usize);
+            if !output
+                .push(extent.physical + relative, length)
+                .ok_or(Error::Corrupt)?
+            {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn matches(&self, path: &str) -> bool {
         self.valid && self.path == path
     }

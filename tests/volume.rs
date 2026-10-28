@@ -27,6 +27,8 @@ struct State {
     fail_write_number: Option<usize>,
     largest_write: usize,
     readonly: bool,
+    window: Option<(u64, usize, usize)>,
+    window_writes: usize,
 }
 #[derive(Clone)]
 struct Disk(Arc<Mutex<State>>);
@@ -70,6 +72,35 @@ impl Disk {
     }
 }
 impl BlockDevice for Disk {
+    fn begin_write_window(&mut self, token: u64, input: &[u8]) -> Result<(), BlockError> {
+        let mut state = require_ok(self.0.lock());
+        if token == 0 || state.window.is_some() {
+            return Err(BlockError::InvalidRange);
+        }
+        state.window = Some((token, input.as_ptr() as usize, input.len()));
+        Ok(())
+    }
+    fn end_write_window(&mut self) {
+        require_ok(self.0.lock()).window = None;
+    }
+    fn is_write_window(&self, input: &[u8]) -> bool {
+        require_ok(self.0.lock())
+            .window
+            .is_some_and(|(_, base, length)| {
+                (input.as_ptr() as usize)
+                    .checked_sub(base)
+                    .and_then(|offset| offset.checked_add(input.len()))
+                    .is_some_and(|end| end <= length)
+            })
+    }
+    fn submit_write_window(&mut self, first: u64, input: &[u8]) -> Result<(), BlockError> {
+        if !self.is_write_window(input) {
+            return Err(BlockError::InvalidRange);
+        }
+        require_ok(self.0.lock()).window_writes += 1;
+        self.write_sectors(first, input)
+    }
+
     fn is_read_only(&self) -> bool {
         require_ok(self.0.lock()).readonly
     }
@@ -117,6 +148,272 @@ impl BlockDevice for Disk {
             Ok(())
         }
     }
+}
+
+#[derive(Default)]
+struct DeferredState {
+    submitted: usize,
+    outstanding: usize,
+    peak: usize,
+    joins: usize,
+    reads_with_writes: usize,
+    fail_read_after_submission: bool,
+}
+
+/// Delays media writes until an overlapping read, queue backpressure or the
+/// explicit completion boundary. This detects accidental dependence on the
+/// old synchronous `write_batch` contract in real FAT operations.
+struct DeferredDisk {
+    disk: Disk,
+    state: Arc<Mutex<DeferredState>>,
+    pending: Vec<(u64, Vec<u8>)>,
+}
+
+impl DeferredDisk {
+    fn new(disk: Disk) -> (Self, Arc<Mutex<DeferredState>>) {
+        let state = Arc::new(Mutex::new(DeferredState::default()));
+        (
+            Self {
+                disk,
+                state: state.clone(),
+                pending: Vec::new(),
+            },
+            state,
+        )
+    }
+
+    fn complete_one(&mut self, index: usize) -> Result<(), BlockError> {
+        let (first, bytes) = self.pending.remove(index);
+        require_ok(self.state.lock()).outstanding -= 1;
+        self.disk.write_sectors(first, &bytes)
+    }
+}
+
+impl BlockDevice for DeferredDisk {
+    fn begin_write_window(&mut self, token: u64, input: &[u8]) -> Result<(), BlockError> {
+        self.disk.begin_write_window(token, input)
+    }
+
+    fn end_write_window(&mut self) {
+        // The source may be refilled as soon as this returns. Accepted writes
+        // must therefore be retired on failure as well as success.
+        assert_eq!(require_ok(self.state.lock()).outstanding, 0);
+        self.disk.end_write_window();
+    }
+
+    fn is_write_window(&self, input: &[u8]) -> bool {
+        self.disk.is_write_window(input)
+    }
+
+    fn submit_write_window(&mut self, first: u64, input: &[u8]) -> Result<(), BlockError> {
+        if !self.is_write_window(input) {
+            return Err(BlockError::InvalidRange);
+        }
+        require_ok(self.disk.0.lock()).window_writes += 1;
+        self.submit_writes(&[WriteRequest {
+            first,
+            bytes: input,
+        }])
+    }
+
+    fn sector_count(&self) -> u64 {
+        self.disk.sector_count()
+    }
+
+    fn read_sectors(&mut self, first: u64, output: &mut [u8]) -> Result<(), BlockError> {
+        validate_range(self.sector_count(), first, output.len())?;
+        {
+            let mut state = require_ok(self.state.lock());
+            if !self.pending.is_empty() {
+                state.reads_with_writes += 1;
+            }
+            if state.submitted != 0 && state.fail_read_after_submission {
+                return Err(BlockError::Io);
+            }
+        }
+        let end = first + (output.len() / SECTOR_SIZE) as u64;
+        let mut index = 0;
+        while index < self.pending.len() {
+            let (start, bytes) = &self.pending[index];
+            let stop = start + (bytes.len() / SECTOR_SIZE) as u64;
+            if *start < end && first < stop {
+                self.complete_one(index)?;
+            } else {
+                index += 1;
+            }
+        }
+        self.disk.read_sectors(first, output)
+    }
+
+    fn write_sectors(&mut self, first: u64, input: &[u8]) -> Result<(), BlockError> {
+        self.submit_writes(&[WriteRequest {
+            first,
+            bytes: input,
+        }])?;
+        self.complete_writes()
+    }
+
+    fn submit_writes(&mut self, requests: &[WriteRequest<'_>]) -> Result<(), BlockError> {
+        crate::block::validate_writes(self.sector_count(), requests)?;
+        for request in requests {
+            if request.bytes.is_empty() {
+                continue;
+            }
+            if self.pending.len() == 4 {
+                self.complete_one(0)?;
+            }
+            self.pending.push((request.first, request.bytes.to_vec()));
+            let mut state = require_ok(self.state.lock());
+            state.submitted += 1;
+            state.outstanding += 1;
+            state.peak = state.peak.max(state.outstanding);
+        }
+        Ok(())
+    }
+
+    fn complete_writes(&mut self) -> Result<(), BlockError> {
+        require_ok(self.state.lock()).joins += 1;
+        let mut failure = None;
+        while !self.pending.is_empty() {
+            if let Err(error) = self.complete_one(0) {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    fn flush(&mut self) -> Result<(), BlockError> {
+        self.complete_writes()?;
+        self.disk.flush()
+    }
+}
+
+#[test]
+fn asynchronous_fat_128k_write_overlaps_with_an_unaligned_data_region() {
+    let disk = Disk::fresh();
+    // The first data sector is 32 + 2 * 600 = 1232, deliberately not aligned
+    // to the adapter's 256-sector windows. Ordinary IPC writes are only 128KiB;
+    // testing a multi-MiB call would conceal an aligned-full-window trigger.
+    let (device, deferred) = DeferredDisk::new(disk.clone());
+    let mut fs = require_ok(FatVolume::mount(device));
+    // Leave the next allocation near a FAT read-window boundary. Its refill
+    // happens after the first 64KiB of new data, making real overlap observable
+    // even though most metadata accesses are served by the sector cache.
+    require_ok(fs.create("prefix", false));
+    require_ok(fs.write_at("prefix", 0, &vec![0x6d; 853 * SECTOR_SIZE]));
+    require_ok(fs.create("unaligned", false));
+    *require_ok(deferred.lock()) = DeferredState::default();
+    let contents: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
+    require_ok(fs.write_at("unaligned", 0, &contents));
+    {
+        let state = require_ok(deferred.lock());
+        assert!(
+            state.reads_with_writes > 0,
+            "128KiB write did not submit before the FAT traversal finished"
+        );
+        assert_eq!(state.outstanding, 0);
+    }
+    drop(fs);
+    let mut fs = require_ok(FatVolume::mount(disk));
+    let mut output = vec![0; contents.len()];
+    assert_eq!(
+        require_ok(fs.read_at("unaligned", 0, &mut output)),
+        output.len()
+    );
+    assert_eq!(output, contents);
+}
+
+#[test]
+fn asynchronous_fat_writes_overlap_work_and_join_before_reply() {
+    let disk = Disk::fresh();
+    let (device, deferred) = DeferredDisk::new(disk.clone());
+    let mut fs = require_ok(FatVolume::mount(device));
+    require_ok(fs.create("stream", false));
+    let contents: Vec<u8> = (0..2 * 1024 * 1024 + 37).map(|i| (i % 251) as u8).collect();
+    require_ok(fs.write_at("stream", 0, &contents));
+    {
+        let state = require_ok(deferred.lock());
+        assert!(state.peak > 1, "writes remained synchronous");
+        assert!(
+            state.reads_with_writes > 0,
+            "no FAT work overlapped submissions"
+        );
+        assert_eq!(
+            state.outstanding, 0,
+            "successful reply leaked pending writes"
+        );
+    }
+    assert_eq!(require_ok(disk.0.lock()).flushes, 0);
+    // Reopen the physical view without an explicit durability flush: operation
+    // completion alone must have made all data/metadata available to readers.
+    drop(fs);
+    let mut fs = require_ok(FatVolume::mount(disk));
+    let mut output = vec![0; contents.len()];
+    assert_eq!(
+        require_ok(fs.read_at("stream", 0, &mut output)),
+        output.len()
+    );
+    assert_eq!(output, contents);
+}
+
+#[test]
+fn asynchronous_fat_completion_failure_is_latched_and_joined() {
+    let disk = Disk::fresh();
+    let (device, deferred) = DeferredDisk::new(disk.clone());
+    let mut fs = require_ok(FatVolume::mount(device));
+    require_ok(fs.create("failure", false));
+    require_ok(disk.0.lock()).fail_writes = true;
+    assert!(fs.write_at("failure", 0, &vec![0xa5; 512 * 1024]).is_err());
+    assert_eq!(require_ok(deferred.lock()).outstanding, 0);
+    let submitted = require_ok(deferred.lock()).submitted;
+    assert!(fs.write_at("failure", 0, &[0x55; 512]).is_err());
+    assert_eq!(require_ok(deferred.lock()).submitted, submitted);
+}
+
+#[test]
+fn asynchronous_fat_read_failure_still_joins_earlier_writes() {
+    let disk = Disk::fresh();
+    let (device, deferred) = DeferredDisk::new(disk);
+    let mut fs = require_ok(FatVolume::mount(device));
+    require_ok(fs.create("failure", false));
+    {
+        let mut state = require_ok(deferred.lock());
+        state.submitted = 0;
+        state.fail_read_after_submission = true;
+    }
+    assert!(
+        fs.write_at("failure", 0, &vec![0x39; 2 * 1024 * 1024])
+            .is_err()
+    );
+    let state = require_ok(deferred.lock());
+    assert!(
+        state.submitted > 0,
+        "test failed before exercising queued writes"
+    );
+    assert_eq!(state.outstanding, 0, "failure bypassed completion cleanup");
+}
+
+#[test]
+fn asynchronous_fat_window_reuse_observes_prior_partial_writes() {
+    let disk = Disk::fresh();
+    let (device, deferred) = DeferredDisk::new(disk);
+    let mut fs = require_ok(FatVolume::mount(device));
+    require_ok(fs.create("reuse", false));
+    let mut contents = vec![0x5a; 2 * 1024 * 1024 + 37];
+    require_ok(fs.write_at("reuse", 0, &contents));
+    for offset in [511, 128 * 1024 - 7, 1024 * 1024 + 511] {
+        let replacement = [0xa7; 1031];
+        require_ok(fs.write_at("reuse", offset as u64, &replacement));
+        contents[offset..offset + replacement.len()].copy_from_slice(&replacement);
+    }
+    let mut output = vec![0; contents.len()];
+    assert_eq!(
+        require_ok(fs.read_at("reuse", 0, &mut output)),
+        output.len()
+    );
+    assert_eq!(output, contents);
+    assert_eq!(require_ok(deferred.lock()).outstanding, 0);
+    require_ok(fs.sync());
 }
 #[test]
 fn fat_first_read_builds_the_allocation_map_without_an_eof_seek() {
@@ -1405,4 +1702,143 @@ fn drained_reopen_preserves_directory_cursor_and_written_data() {
     let mut contents = [0; 64];
     let length = require_ok(replacement.read_at("file-000.txt", 0, &mut contents));
     assert_eq!(&contents[..length], b"survives provider replacement");
+}
+
+#[test]
+fn readonly_write_window_bypasses_data_windows_and_read_plan_matches_bytes() {
+    use hyper_filesystem::protocol::{EXTENT_PLAN_BYTES, ReadExtentPlan};
+    let disk = Disk::fresh();
+    let mut volume = require_ok(FatVolume::mount(disk.clone()));
+    require_ok(volume.create("window.bin", false));
+    let input = (0..128 * 1024 + 19)
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        require_ok(volume.write_window("window.bin", 0, &input, 27)),
+        input.len()
+    );
+    {
+        let state = require_ok(disk.0.lock());
+        assert!(state.window_writes != 0);
+        assert!(state.window.is_none());
+    }
+    let mut response = [0; EXTENT_PLAN_BYTES];
+    let encoded = require_ok(volume.read_extents("window.bin", 7, input.len(), &mut response));
+    let plan = require_ok(
+        ReadExtentPlan::decode(&response[..encoded], input.len()).ok_or("valid read plan"),
+    );
+    assert_eq!(plan.length(), input.len() - 7);
+    let state = require_ok(disk.0.lock());
+    let mut actual = Vec::new();
+    for extent in plan.extents() {
+        for offset in extent.offset..extent.offset + extent.length {
+            actual.push(
+                require_ok(state.sectors.get(&(offset / 512)).ok_or("written sector"))
+                    [offset as usize % 512],
+            );
+        }
+    }
+    assert_eq!(actual, input[7..]);
+    drop(state);
+    let encoded =
+        require_ok(volume.read_extents("window.bin", input.len() as u64, 512, &mut response));
+    assert_eq!(
+        require_ok(ReadExtentPlan::decode(&response[..encoded], 512).ok_or("EOF plan")).length(),
+        0
+    );
+}
+
+#[test]
+fn windowed_sequential_write_keeps_disjoint_metadata_coalesced() {
+    let disk = Disk::fresh();
+    let mut volume = require_ok(FatVolume::mount(disk.clone()));
+    require_ok(volume.create("coalesced.bin", false));
+    let before = require_ok(disk.0.lock()).writes;
+    let input = vec![0x5a; 128 * 1024];
+    assert_eq!(
+        require_ok(volume.write_window("coalesced.bin", 0, &input, 51)),
+        input.len()
+    );
+    {
+        let state = require_ok(disk.0.lock());
+        let metadata_writes = state.writes - before - state.window_writes;
+        assert!(
+            metadata_writes <= 16,
+            "sequential window write issued {metadata_writes} metadata writes"
+        );
+    }
+    require_ok(volume.sync());
+    drop(volume);
+    let mut volume = require_ok(FatVolume::mount(disk));
+    let mut actual = vec![0; input.len()];
+    assert_eq!(
+        require_ok(volume.read_at("coalesced.bin", 0, &mut actual)),
+        input.len()
+    );
+    assert_eq!(actual, input);
+}
+
+#[test]
+fn failed_window_write_clears_source_and_poisoned_plan_fails() {
+    let disk = Disk::fresh();
+    let mut volume = require_ok(FatVolume::mount(disk.clone()));
+    require_ok(volume.create("window.bin", false));
+    require_ok(volume.write_at("window.bin", 0, &[7; 4096]));
+    require_ok(disk.0.lock()).fail_writes = true;
+    assert!(
+        volume
+            .write_window("window.bin", 0, &[8; 4096], 28)
+            .is_err()
+    );
+    assert!(require_ok(disk.0.lock()).window.is_none());
+    let mut response = [0; hyper_filesystem::protocol::EXTENT_PLAN_BYTES];
+    assert!(
+        volume
+            .read_extents("window.bin", 0, 4096, &mut response)
+            .is_err()
+    );
+}
+
+#[test]
+fn asynchronous_window_write_drains_before_releasing_source() {
+    let disk = Disk::fresh();
+    let (device, state) = DeferredDisk::new(disk.clone());
+    let mut volume = require_ok(FatVolume::mount(device));
+    require_ok(volume.create("async-window.bin", false));
+    let input = (0..128 * 1024 + 19)
+        .map(|i| (i % 239) as u8)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        require_ok(volume.write_window("async-window.bin", 7, &input, 41)),
+        input.len()
+    );
+    assert_eq!(require_ok(state.lock()).outstanding, 0);
+    assert!(require_ok(state.lock()).peak > 1);
+    assert!(require_ok(disk.0.lock()).window_writes > 0);
+    assert!(require_ok(disk.0.lock()).window.is_none());
+    let mut output = vec![0; input.len()];
+    assert_eq!(
+        require_ok(volume.read_at("async-window.bin", 7, &mut output)),
+        input.len()
+    );
+    assert_eq!(output, input);
+}
+
+#[test]
+fn asynchronous_window_completion_failure_drains_all_accepted_writes() {
+    let disk = Disk::fresh();
+    let (device, state) = DeferredDisk::new(disk.clone());
+    let mut volume = require_ok(FatVolume::mount(device));
+    require_ok(volume.create("async-window.bin", false));
+    require_ok(volume.write_at("async-window.bin", 0, &vec![7; 128 * 1024]));
+    let submitted = require_ok(state.lock()).submitted;
+    require_ok(disk.0.lock()).fail_writes = true;
+    assert!(
+        volume
+            .write_window("async-window.bin", 0, &vec![8; 128 * 1024], 42)
+            .is_err()
+    );
+    assert!(require_ok(state.lock()).submitted > submitted);
+    assert_eq!(require_ok(state.lock()).outstanding, 0);
+    assert!(require_ok(disk.0.lock()).window.is_none());
 }

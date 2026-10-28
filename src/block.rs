@@ -1,9 +1,13 @@
 // SPDX-FileCopyrightText: 2026 roolrz
 // SPDX-License-Identifier: Apache-2.0
 
-//! Synchronous, sleepable access to an exclusively owned logical block volume.
+//! Sleepable block access with operation-scoped asynchronous write submission.
 
 pub const SECTOR_SIZE: usize = 512;
+/// Maximum descriptors in one admission. Larger drains stream several batches.
+pub const WRITE_BATCH_REQUESTS: usize = 16;
+/// Maximum payload in one atomic queue admission.
+pub const WRITE_BATCH_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -39,6 +43,20 @@ pub trait BlockDevice {
     }
     fn read_sectors(&mut self, first: u64, output: &mut [u8]) -> Result<(), Error>;
     fn write_sectors(&mut self, first: u64, input: &[u8]) -> Result<(), Error>;
+    /// Establish a readonly kernel-window input for this synchronous filesystem
+    /// operation. Generic devices retain the ordinary copying implementation.
+    fn begin_write_window(&mut self, _token: u64, _input: &[u8]) -> Result<(), Error> {
+        Ok(())
+    }
+    fn end_write_window(&mut self) {}
+    /// This is an optimization hint only; the kernel validates the operation
+    /// token and every submitted offset independently of this pointer check.
+    fn is_write_window(&self, _input: &[u8]) -> bool {
+        false
+    }
+    fn submit_write_window(&mut self, _first: u64, _input: &[u8]) -> Result<(), Error> {
+        Err(Error::Unsupported)
+    }
     /// Complete disjoint writes, possibly in parallel and in any order. Check
     /// every range before submitting the first request. On error, any subset
     /// may have reached the medium; no borrowed input outlives this call.
@@ -49,6 +67,20 @@ pub trait BlockDevice {
                 self.write_sectors(request.first, request.bytes)?;
             }
         }
+        Ok(())
+    }
+    /// Accept disjoint writes without requiring device completion. Implementors
+    /// must copy the input before returning and bound outstanding resources.
+    /// Later overlapping reads/writes observe submission order; independent
+    /// requests may complete in any order. Backpressure may sleep to reap prior
+    /// submissions. A failed admission can leave earlier batches outstanding.
+    fn submit_writes(&mut self, requests: &[WriteRequest<'_>]) -> Result<(), Error> {
+        self.write_batch(requests)
+    }
+    /// Join every accepted write, including after another operation failed.
+    /// This is a completion boundary, not a physical durability barrier. Return
+    /// the first failure only after retiring all outstanding completion tokens.
+    fn complete_writes(&mut self) -> Result<(), Error> {
         Ok(())
     }
     fn flush(&mut self) -> Result<(), Error>;

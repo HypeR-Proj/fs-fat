@@ -27,3 +27,6 @@ workspace = true
 
 [lib]
 name = "hyper_fs_fat"
+
+[features]
+block-queue-test = []

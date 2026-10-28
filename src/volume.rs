@@ -111,6 +111,23 @@ impl<D: BlockDevice> DeviceSlot<D> {
         }
         Ok(())
     }
+    /// Finish previously accepted writes even after the operation budget or
+    /// device fails. This may submit buffered window ranges, so it bypasses
+    /// `access`, whose admission guard rejects new work on a poisoned volume.
+    fn complete_writes(&self) -> Result<(), BlockError> {
+        let mut device = self
+            .device
+            .try_borrow_mut()
+            .map_err(|_| BlockError::Io)?
+            .take()
+            .ok_or(BlockError::Io)?;
+        let result = device.complete_writes();
+        *self.device.try_borrow_mut().map_err(|_| BlockError::Io)? = Some(device);
+        if let Err(error) = result {
+            self.fail(error);
+        }
+        result
+    }
     fn fail(&self, error: BlockError) {
         let code = match error {
             BlockError::InvalidRange => 1,
@@ -241,8 +258,9 @@ impl<D: BlockDevice> Write for Disk<D> {
         Ok(n)
     }
     fn flush(&mut self) -> Result<(), BlockError> {
-        // Complete buffered transfers, without a physical durability barrier.
-        // Upstream also calls this from read-only directory destructors.
+        // Submit buffered transfers, without a physical durability barrier.
+        // Operation exit joins them. Upstream also calls this from read-only
+        // directory destructors, which must not serialize independent writes.
         self.owner.charge()?;
         self.writes.drain(&self.owner)
     }
@@ -360,9 +378,11 @@ impl<D: BlockDevice> FatVolume<D> {
                 sector,
             },
             fatfs::FsOptions::new().strict(true).time_provider(clock),
-        )
-        .map_err(Error::from)?;
+        );
+        let completed = owner.complete_writes();
         owner.enabled.store(false, Ordering::Relaxed);
+        completed.map_err(Error::Block)?;
+        let fs = fs.map_err(Error::from)?;
         // Bounds repeated FAT traversal on corrupt media. Count seeks as well
         // as transfers, so cache additions cannot defeat this limit.
         let budget = sectors.saturating_mul(32).max(4096);
@@ -423,6 +443,9 @@ impl<D: BlockDevice> FatVolume<D> {
         // A poisoned device rejects this drain without any further transfers.
         if let Err(error) = fs.flush_storage() {
             result = Err(Error::from(error));
+        }
+        if let Err(error) = self.device.complete_writes() {
+            result = Err(Error::Block(error));
         }
         self.device.enabled.store(false, Ordering::Relaxed);
         match self.device.failure() {
@@ -555,6 +578,85 @@ impl<D: BlockDevice> FatVolume<D> {
             Ok(done)
         })
     }
+    /// Describe an immutable-in-transaction file prefix without copying its
+    /// contents through the worker. The caller must serialize mutations until
+    /// all block reads described by this plan have completed.
+    pub fn read_extents(
+        &mut self,
+        path: &str,
+        offset: u64,
+        length: usize,
+        output: &mut [u8],
+    ) -> Result<usize, Error> {
+        use hyper_filesystem::protocol::{DATA_BYTES, ReadExtentPlanBuilder};
+        validate_path(path)?;
+        if length > DATA_BYTES {
+            return Err(Error::InvalidInput);
+        }
+        let mut builder = ReadExtentPlanBuilder::new(output).ok_or(Error::InvalidInput)?;
+        let index = self.read_maps.select(path);
+        let mut map = self.read_maps.take(index)?;
+        let sectors = self.device.sectors;
+        let result = self.run(|fs| {
+            if !map.matches(path) {
+                map.prepare(fs, path, sectors)?;
+            }
+            if map.complete() {
+                map.plan(offset, length, &mut builder)?;
+                return Ok(true);
+            }
+            Ok(false)
+        });
+        self.read_maps.put(index, map);
+        if result? {
+            return Ok(builder.finish());
+        }
+        // Fragmentation cannot make the response or retained map unbounded.
+        // Ordinary FAT traversal still validates the requested prefix, and a
+        // full plan resumes at the next file offset in a later transaction.
+        self.run(|fs| {
+            let mut file = fs.root_dir().open_file(path).map_err(Error::from)?;
+            let size = u64::from(file.size().ok_or(Error::Corrupt)?);
+            let count = length.min(size.saturating_sub(offset) as usize);
+            let mut logical = 0u64;
+            for extent in file.extents() {
+                if builder.length() == count {
+                    break;
+                }
+                let extent = extent.map_err(Error::from)?;
+                let end = logical
+                    .checked_add(u64::from(extent.size))
+                    .ok_or(Error::Corrupt)?;
+                if extent.size == 0
+                    || end > size
+                    || extent
+                        .offset
+                        .checked_add(u64::from(extent.size))
+                        .is_none_or(|end| end > sectors * SECTOR_SIZE as u64)
+                {
+                    return Err(Error::Corrupt);
+                }
+                let position = offset + builder.length() as u64;
+                if position < end {
+                    let relative = position.checked_sub(logical).ok_or(Error::Corrupt)?;
+                    let n = (count - builder.length()).min((end - position) as usize);
+                    if !builder
+                        .push(extent.offset + relative, n)
+                        .ok_or(Error::Corrupt)?
+                    {
+                        break;
+                    }
+                }
+                logical = end;
+            }
+            if builder.length() == 0 && count != 0 {
+                return Err(Error::Corrupt);
+            }
+            Ok(())
+        })?;
+        Ok(builder.finish())
+    }
+
     pub fn write_at(&mut self, path: &str, offset: u64, input: &[u8]) -> Result<usize, Error> {
         validate_path(path)?;
         self.writable()?;
@@ -580,6 +682,37 @@ impl<D: BlockDevice> FatVolume<D> {
             file.flush().map_err(Error::from)?;
             Ok(input.len())
         })
+    }
+    /// Preserve the kernel-owned readonly source through FAT's cluster walk.
+    /// The ordinary operation boundary drains all accepted writes before this
+    /// context is cleared, including partial metadata/allocation failures.
+    pub fn write_window(
+        &mut self,
+        path: &str,
+        offset: u64,
+        input: &[u8],
+        token: u64,
+    ) -> Result<usize, Error> {
+        {
+            let mut device = self
+                .device
+                .device
+                .try_borrow_mut()
+                .map_err(|_| Error::Corrupt)?;
+            device
+                .as_mut()
+                .ok_or(Error::Closed)?
+                .begin_write_window(token, input)
+                .map_err(Error::Block)?;
+        }
+        let result = self.write_at(path, offset, input);
+        let mut device = self
+            .device
+            .device
+            .try_borrow_mut()
+            .map_err(|_| Error::Corrupt)?;
+        device.as_mut().ok_or(Error::Closed)?.end_write_window();
+        result
     }
     pub fn create(&mut self, path: &str, directory: bool) -> Result<(), Error> {
         validate_path(path)?;
@@ -758,14 +891,20 @@ impl<D: BlockDevice> FatVolume<D> {
         let fs = self.fs.as_mut().ok_or(Error::Closed)?;
         self.device.remaining.store(self.budget, Ordering::Relaxed);
         self.device.enabled.store(true, Ordering::Relaxed);
-        let result = (|| {
+        let mut result = (|| {
             // No upstream file/editor escapes a volume operation. All edits
             // have been flushed before this filesystem-wide synchronization.
             fs.sync().map_err(Error::from)?;
+            self.device.complete_writes().map_err(Error::Block)?;
             // Disk::flush intentionally avoids barriers for ordinary file
             // drops. Only an explicit volume sync flushes the actual medium.
             self.device.access(BlockDevice::flush).map_err(Error::Block)
         })();
+        // Even failed metadata work can have submitted earlier independent
+        // writes. Retire those before poisoning/closing this generation.
+        if let Err(error) = self.device.complete_writes() {
+            result = Err(Error::Block(error));
+        }
         match &result {
             Err(Error::Corrupt) => self.device.fail(BlockError::Corrupt),
             Err(Error::Block(error)) => self.device.fail(*error),

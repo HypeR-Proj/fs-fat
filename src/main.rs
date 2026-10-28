@@ -7,80 +7,16 @@ use hyper_filesystem::{
     Timestamp,
     protocol::{self, Entry, Error},
 };
-use hyper_fs_fat::{
-    FatVolume,
-    block::{BlockDevice, Error as BlockError},
-};
+use hyper_fs_fat::{FatVolume, block::Error as BlockError};
 use hyper_fs_service::Volume;
-use hyper_os::block::NativeBlock;
+use hyper_os::block::{BlockQueue, NativeBlock, QueueConfig};
 
-struct Device {
-    block: NativeBlock,
-    sectors: u64,
-    readonly: bool,
-}
+mod device;
+use device::Device;
 
-impl BlockDevice for Device {
-    fn is_read_only(&self) -> bool {
-        self.readonly
-    }
-
-    fn sector_count(&self) -> u64 {
-        self.sectors
-    }
-
-    fn read_sectors(&mut self, first: u64, output: &mut [u8]) -> Result<(), BlockError> {
-        hyper_fs_fat::block::validate_range(self.sectors, first, output.len())?;
-        for (index, bytes) in output.chunks_mut(protocol::DATA_BYTES).enumerate() {
-            self.block
-                .read_sectors(first + (index * protocol::DATA_BYTES / 512) as u64, bytes)
-                .map_err(block_error)?;
-        }
-        Ok(())
-    }
-
-    fn write_sectors(&mut self, first: u64, input: &[u8]) -> Result<(), BlockError> {
-        hyper_fs_fat::block::validate_range(self.sectors, first, input.len())?;
-        for (index, bytes) in input.chunks(protocol::DATA_BYTES).enumerate() {
-            self.block
-                .write_sectors(first + (index * protocol::DATA_BYTES / 512) as u64, bytes)
-                .map_err(block_error)?;
-        }
-        Ok(())
-    }
-
-    fn write_batch(
-        &mut self,
-        requests: &[hyper_fs_fat::block::WriteRequest<'_>],
-    ) -> Result<(), BlockError> {
-        hyper_fs_fat::block::validate_writes(self.sectors, requests)?;
-        let mut batch = [hyper_os::block::WriteRequest {
-            first: 0,
-            bytes: &[],
-        }; 4];
-        if requests.is_empty() {
-            return Ok(());
-        }
-        if requests.len() > batch.len() {
-            return Err(BlockError::InvalidRange);
-        }
-
-        for (target, source) in batch.iter_mut().zip(requests) {
-            *target = hyper_os::block::WriteRequest {
-                first: source.first,
-                bytes: source.bytes,
-            };
-        }
-
-        self.block
-            .write_batch(&batch[..requests.len()])
-            .map_err(block_error)
-    }
-
-    fn flush(&mut self) -> Result<(), BlockError> {
-        self.block.flush().map_err(block_error)
-    }
-}
+#[cfg(feature = "block-queue-test")]
+#[path = "../../../tests/app/block-queue-probe.rs"]
+mod queue_probe;
 
 struct Fat(FatVolume<Device>);
 
@@ -100,12 +36,36 @@ impl Volume for Fat {
             .map_err(map_error)
     }
 
+    fn read_extents(
+        &mut self,
+        path: &str,
+        offset: u64,
+        length: usize,
+        output: &mut [u8],
+    ) -> Result<usize, Error> {
+        self.0
+            .read_extents(path, offset, length, output)
+            .map_err(map_error)
+    }
+
     fn read(&mut self, path: &str, offset: u64, output: &mut [u8]) -> Result<usize, Error> {
         self.0.read_at(path, offset, output).map_err(map_error)
     }
 
     fn write(&mut self, path: &str, offset: u64, input: &[u8]) -> Result<usize, Error> {
         self.0.write_at(path, offset, input).map_err(map_error)
+    }
+
+    fn write_window(
+        &mut self,
+        path: &str,
+        offset: u64,
+        input: &[u8],
+        token: u64,
+    ) -> Result<usize, Error> {
+        self.0
+            .write_window(path, offset, input, token)
+            .map_err(map_error)
     }
 
     fn create(&mut self, path: &str, directory: bool) -> Result<(), Error> {
@@ -152,14 +112,6 @@ fn metadata(value: hyper_fs_fat::Entry) -> Entry {
         created: value.created,
         accessed: value.accessed,
         modified: value.modified,
-    }
-}
-
-fn block_error(error: hyper_os::Error) -> BlockError {
-    match error {
-        hyper_os::Error::Status(hyper_os::Status::READ_ONLY) => BlockError::ReadOnly,
-        hyper_os::Error::Status(hyper_os::Status::INVALID_ARGUMENT) => BlockError::InvalidRange,
-        _ => BlockError::Io,
     }
 }
 
@@ -225,12 +177,38 @@ fn run() -> Result<(), String> {
         )
     };
 
+    #[cfg(feature = "block-queue-test")]
+    queue_probe::run(
+        &block,
+        sectors,
+        readonly,
+        startup.borrow(hyper_os::startup::ROOT_VMAR).map_err(show)?,
+    )?;
+
+    let queue = match adopted.as_ref() {
+        Some(state) => BlockQueue::from_handle(
+            state
+                .queue()
+                .ok_or("adopted filesystem has no block queue")?
+                .duplicate(hyper_service::filesystem::QUEUE_RIGHTS)
+                .map_err(show)?,
+        ),
+        None => block.create_queue(QueueConfig::default()).map_err(show)?,
+    };
+
     let volume = FatVolume::mount_with_clock(
-        Device {
+        Device::new(
             block,
             sectors,
             readonly,
-        },
+            BlockQueue::from_handle(
+                queue
+                    .as_handle_ref()
+                    .duplicate(hyper_service::filesystem::QUEUE_RIGHTS)
+                    .map_err(show)?,
+            ),
+        )
+        .map_err(show)?,
         realtime,
     )
     .map_err(show)?;
@@ -238,10 +216,10 @@ fn run() -> Result<(), String> {
     let mut volume = Fat(volume);
     let completion = match adopted {
         Some(state) => hyper_fs_service::resume(state, &mut volume)?,
-        None => hyper_fs_service::serve(&mut startup, &mut volume)?,
+        None => hyper_fs_service::serve(&mut startup, &mut volume, queue)?,
     };
     let device = volume.0.into_device().map_err(show)?;
-    hyper_fs_service::return_block(completion, device.block)
+    hyper_fs_service::return_block(completion, device.into_block().map_err(show)?)
 }
 
 fn show(error: impl core::fmt::Debug) -> String {
