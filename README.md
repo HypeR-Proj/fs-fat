@@ -13,8 +13,8 @@ workspace setup and the installed SDK build boundary.
 Use the [HypeR workspace](https://github.com/HypeR-Proj/HypeR) to resolve dependencies:
 
 ```sh
-./HypeR/hyper test fs-fat
+python3 project.py test fs-fat
 ```
 
-Build paths in detailed documentation refer to the generated `out/system` directory.
+Paths in the documentation are relative to the repo-managed workspace root.
 Edit this repository and prepare the workspace again before building.
