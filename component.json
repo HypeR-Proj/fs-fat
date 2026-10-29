@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "name": "fs-fat",
+  "kind": "service",
+  "origin": {
+    "repository": "https://github.com/roolrz/HypeR",
+    "commit": "8d42d047058a2b58a291803700e86487fb723f7a"
+  },
+  "sources": {
+    "Cargo.toml": "svc/fs-fat/Cargo.toml",
+    "component.mk": "svc/fs-fat/component.mk",
+    "src/allocation.rs": "svc/fs-fat/src/allocation.rs",
+    "src/block.rs": "svc/fs-fat/src/block.rs",
+    "src/device.rs": "svc/fs-fat/src/device.rs",
+    "src/fat_time.rs": "svc/fs-fat/src/fat_time.rs",
+    "src/fat_validate.rs": "svc/fs-fat/src/fat_validate.rs",
+    "src/lib.rs": "svc/fs-fat/src/lib.rs",
+    "src/main.rs": "svc/fs-fat/src/main.rs",
+    "src/volume.rs": "svc/fs-fat/src/volume.rs",
+    "src/volume/directory.rs": "svc/fs-fat/src/volume/directory.rs",
+    "src/volume/read_map.rs": "svc/fs-fat/src/volume/read_map.rs",
+    "src/volume/sector_cache.rs": "svc/fs-fat/src/volume/sector_cache.rs",
+    "src/volume/write_buffer.rs": "svc/fs-fat/src/volume/write_buffer.rs",
+    "tests/volume.rs": "svc/fs-fat/tests/volume.rs"
+  },
+  "SPDX-FileCopyrightText": "2026 roolrz",
+  "SPDX-License-Identifier": "Apache-2.0",
+  "mounts": {
+    "": "svc/fs-fat"
+  },
+  "packages": [
+    "hyper-fs-fat-system"
+  ],
+  "tests": [
+    [
+      "make",
+      "app-test",
+      "APP_TEST_PACKAGE=hyper-fs-fat-system"
+    ]
+  ]
+}
