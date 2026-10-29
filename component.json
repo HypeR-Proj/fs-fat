@@ -37,5 +37,36 @@
       "app-test",
       "APP_TEST_PACKAGE=hyper-fs-fat-system"
     ]
-  ]
+  ],
+  "cargo_context": {
+    "Cargo.toml": {
+      "workspace": null,
+      "membership": "../../app",
+      "dependency_paths": {
+        "/dependencies/hyper-service": "lib/service",
+        "/dependencies/hyper-fs-service": "lib/fs-service",
+        "/dependencies/fatfs": "third_party/rust-fatfs"
+      },
+      "inherited_dependencies": {
+        "/dependencies/hyper-os": {
+          "workspace": true,
+          "features": [
+            "std"
+          ]
+        },
+        "/dependencies/hyper-rt": {
+          "workspace": true
+        },
+        "/dependencies/hyper-service": {
+          "workspace": true
+        },
+        "/dependencies/hyper-filesystem": {
+          "workspace": true
+        },
+        "/dependencies/hyper-fs-service": {
+          "workspace": true
+        }
+      }
+    }
+  }
 }

@@ -1,32 +1,77 @@
 # SPDX-FileCopyrightText: 2026 roolrz
 # SPDX-License-Identifier: Apache-2.0
-[package]
-workspace = "../../app"
-name = "hyper-fs-fat-system"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-publish.workspace = true
-autotests = false
-[[bin]]
-name = "hyper-fs-fat-system"
-path = "src/main.rs"
-test = false
-bench = false
-[dependencies]
-hyper-os = { workspace = true, features = ["std"] }
-hyper-rt.workspace = true
-hyper-service.workspace = true
-hyper-filesystem.workspace = true
-hyper-fs-service.workspace = true
-fatfs = { path = "../../third_party/rust-fatfs", default-features = false, features = ["lfn", "unicode"] }
 
-[lints]
-workspace = true
+bin = [
+    { name = "hyper-fs-fat-system", path = "src/main.rs", test = false, bench = false },
+]
+
+[package]
+name = "hyper-fs-fat-system"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/HypeR-Proj/fs-fat"
+publish = false
+autotests = false
+
+[dependencies.hyper-os]
+version = "=0.0.0"
+features = [
+    "std",
+]
+
+[dependencies.hyper-rt]
+version = "=0.0.0"
+features = [
+    "std",
+]
+
+[dependencies.hyper-service]
+version = "=0.0.0"
+
+[dependencies.hyper-filesystem]
+version = "=0.0.0"
+
+[dependencies.hyper-fs-service]
+version = "=0.0.0"
+
+[dependencies.fatfs]
+default-features = false
+features = [
+    "lfn",
+    "unicode",
+]
+version = "=0.4.0"
+
+[lints.clippy]
+doc_markdown = "deny"
+empty_docs = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+undocumented_unsafe_blocks = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+unwrap_used = "deny"
+missing_safety_doc = "deny"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = [
+    "cfg(target_os, values(\"hyper\"))",
+]
 
 [lib]
 name = "hyper_fs_fat"
 
 [features]
 block-queue-test = []
+
+[workspace]
+members = [
+    ".",
+]
+resolver = "3"
