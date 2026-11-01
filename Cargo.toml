@@ -34,7 +34,6 @@ path = "../../lib/fs-service"
 [dependencies.fatfs]
 default-features = false
 features = ["lfn", "unicode"]
-version = "=0.4.0"
 path = "../../third_party/rust-fatfs"
 
 [lints]
