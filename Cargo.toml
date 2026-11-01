@@ -5,32 +5,31 @@ bin = [{name = "hyper-fs-fat-system", path = "src/main.rs", test = false, bench 
 
 [package]
 name = "hyper-fs-fat-system"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/HypeR-Proj/fs-fat"
 publish = false
 autotests = false
-workspace = "../../app"
 
 [dependencies]
 
 [dependencies.hyper-os]
-workspace = true
+version = "=0.0.0"
 features = ["std"]
 
 [dependencies.hyper-rt]
-workspace = true
+version = "=0.0.0"
 features = ["std"]
 
 [dependencies.hyper-service]
-workspace = true
+path = "../../lib/service"
 
 [dependencies.hyper-filesystem]
-workspace = true
+version = "=0.0.0"
 
 [dependencies.hyper-fs-service]
-workspace = true
+path = "../../lib/fs-service"
 
 [dependencies.fatfs]
 default-features = false
@@ -64,3 +63,19 @@ name = "hyper_fs_fat"
 
 [features]
 block-queue-test = []
+
+[workspace]
+resolver = "3"
+members = []
+
+[profile]
+
+[profile.release]
+codegen-units = 1
+debug = 1
+incremental = false
+lto = "fat"
+opt-level = "s"
+overflow-checks = true
+panic = "abort"
+strip = "none"
