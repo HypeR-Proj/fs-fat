@@ -363,7 +363,9 @@ fn asynchronous_fat_completion_failure_is_latched_and_joined() {
     let mut fs = require_ok(FatVolume::mount(device));
     require_ok(fs.create("failure", false));
     require_ok(disk.0.lock()).fail_writes = true;
-    assert!(fs.write_at("failure", 0, &vec![0xa5; 512 * 1024]).is_err());
+    let accepted = require_ok(fs.write_at("failure", 0, &vec![0xa5; 512 * 1024]));
+    assert!((1..=512 * 1024).contains(&accepted));
+    assert_eq!(fs.sync(), Err(Error::Block(BlockError::Io)));
     assert_eq!(require_ok(deferred.lock()).outstanding, 0);
     let submitted = require_ok(deferred.lock()).submitted;
     assert!(fs.write_at("failure", 0, &[0x55; 512]).is_err());
@@ -381,10 +383,9 @@ fn asynchronous_fat_read_failure_still_joins_earlier_writes() {
         state.submitted = 0;
         state.fail_read_after_submission = true;
     }
-    assert!(
-        fs.write_at("failure", 0, &vec![0x39; 2 * 1024 * 1024])
-            .is_err()
-    );
+    let accepted = require_ok(fs.write_at("failure", 0, &vec![0x39; 2 * 1024 * 1024]));
+    assert!((1..2 * 1024 * 1024).contains(&accepted));
+    assert_eq!(fs.read_status(), Err(Error::Block(BlockError::Io)));
     let state = require_ok(deferred.lock());
     assert!(
         state.submitted > 0,
@@ -580,10 +581,8 @@ fn fat_partial_buffer_drain_failure_stops_all_later_io() {
         let mut state = require_ok(disk.0.lock());
         state.fail_write_number = Some(state.writes + 2);
     }
-    assert!(matches!(
-        fs.write_at("file", 0, &vec![0x7a; 256 * 1024]),
-        Err(Error::Block(BlockError::Io))
-    ));
+    let accepted = require_ok(fs.write_at("file", 0, &vec![0x7a; 256 * 1024]));
+    assert!((1..=256 * 1024).contains(&accepted));
     let counts = {
         let state = require_ok(disk.0.lock());
         (state.reads, state.writes, state.flushes)
@@ -594,6 +593,25 @@ fn fat_partial_buffer_drain_failure_stops_all_later_io() {
     drop(fs);
     let state = require_ok(disk.0.lock());
     assert_eq!((state.reads, state.writes, state.flushes), counts);
+}
+
+#[test]
+fn fat_late_drain_failure_preserves_the_full_accepted_count() {
+    let disk = Disk::fresh();
+    let mut fs = require_ok(FatVolume::mount(disk.clone()));
+    require_ok(fs.create("late", false));
+    require_ok(fs.write_at("late", 0, &[0x11; SECTOR_SIZE]));
+    require_ok(disk.0.lock()).fail_writes = true;
+    assert_eq!(
+        fs.write_at("late", 0, &[0x22; SECTOR_SIZE]),
+        Ok(SECTOR_SIZE)
+    );
+    assert_eq!(fs.read_status(), Err(Error::Block(BlockError::Io)));
+    assert_eq!(
+        fs.write_at("late", 0, b"retry"),
+        Err(Error::Block(BlockError::Io))
+    );
+    assert_eq!(fs.sync(), Err(Error::Block(BlockError::Io)));
 }
 
 #[test]
@@ -1085,6 +1103,77 @@ fn fat_create_is_exclusive_and_zero_write_does_not_extend() {
         require_ok(fs.read_at("config.json", u64::MAX, &mut byte)),
         0
     );
+}
+
+fn nearly_full_disk(free_clusters: usize) -> Disk {
+    let disk = Disk::fresh();
+    {
+        let mut state = require_ok(disk.0.lock());
+        let mut allocated = [0u8; SECTOR_SIZE];
+        for entry in allocated.chunks_exact_mut(4) {
+            entry.copy_from_slice(&0x0fff_ffffu32.to_le_bytes());
+        }
+        for sector in 32..1232 {
+            state.sectors.insert(sector, allocated);
+        }
+        for first in [32, 632] {
+            let mut entries = allocated;
+            entries[..4].copy_from_slice(&0x0fff_fff8u32.to_le_bytes());
+            for cluster in 3..3 + free_clusters {
+                entries[cluster * 4..cluster * 4 + 4].fill(0);
+            }
+            state.sectors.insert(first, entries);
+        }
+    }
+    disk
+}
+
+#[test]
+fn fat_enospc_returns_prefix_and_retries_only_the_append_remainder() {
+    let disk = nearly_full_disk(2);
+    let mut fs = require_ok(FatVolume::mount(disk.clone()));
+    require_ok(fs.create("blocker", false));
+    require_ok(fs.write_at("blocker", 0, &[0x11; SECTOR_SIZE]));
+    require_ok(fs.create("partial", false));
+    let mut input = [0x55; SECTOR_SIZE * 2];
+    input[SECTOR_SIZE..].fill(0xaa);
+    let count = require_ok(fs.write_at("partial", 0, &input));
+    assert_eq!(count, SECTOR_SIZE);
+    let end = require_ok(fs.stat("partial")).size;
+    assert_eq!(end, count as u64);
+    assert_eq!(
+        fs.write_at("partial", end, &input[count..]),
+        Err(Error::NoSpace)
+    );
+    require_ok(fs.remove("blocker"));
+    assert_eq!(
+        require_ok(fs.write_at("partial", end, &input[count..])),
+        SECTOR_SIZE
+    );
+    assert_eq!(require_ok(fs.stat("partial")).size, input.len() as u64);
+    require_ok(fs.sync());
+    drop(fs);
+    let mut fs = require_ok(FatVolume::mount(disk));
+    let mut actual = [0; SECTOR_SIZE * 2];
+    assert_eq!(
+        require_ok(fs.read_at("partial", 0, &mut actual)),
+        input.len()
+    );
+    assert_eq!(actual, input);
+}
+
+#[test]
+fn fat_enospc_during_gap_filling_does_not_count_zeroes_as_input() {
+    let mut fs = require_ok(FatVolume::mount(nearly_full_disk(1)));
+    require_ok(fs.create("gap", false));
+    assert_eq!(
+        fs.write_at("gap", (SECTOR_SIZE * 2) as u64, b"payload"),
+        Err(Error::NoSpace)
+    );
+    assert_eq!(require_ok(fs.stat("gap")).size, SECTOR_SIZE as u64);
+    let mut actual = [0xff; SECTOR_SIZE];
+    assert_eq!(require_ok(fs.read_at("gap", 0, &mut actual)), SECTOR_SIZE);
+    assert_eq!(actual, [0; SECTOR_SIZE]);
 }
 
 #[test]
@@ -1833,11 +1922,9 @@ fn asynchronous_window_completion_failure_drains_all_accepted_writes() {
     require_ok(volume.write_at("async-window.bin", 0, &vec![7; 128 * 1024]));
     let submitted = require_ok(state.lock()).submitted;
     require_ok(disk.0.lock()).fail_writes = true;
-    assert!(
-        volume
-            .write_window("async-window.bin", 0, &vec![8; 128 * 1024], 42)
-            .is_err()
-    );
+    let accepted = require_ok(volume.write_window("async-window.bin", 0, &vec![8; 128 * 1024], 42));
+    assert!((1..=128 * 1024).contains(&accepted));
+    assert_eq!(volume.sync(), Err(Error::Block(BlockError::Io)));
     assert!(require_ok(state.lock()).submitted > submitted);
     assert_eq!(require_ok(state.lock()).outstanding, 0);
     assert!(require_ok(disk.0.lock()).window.is_none());
