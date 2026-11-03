@@ -5,31 +5,34 @@ SPDX-License-Identifier: Apache-2.0
 
 # fs-fat
 
-A HypeR component. See [HypeR](https://github.com/HypeR-Proj/HypeR) for
-workspace setup and the installed SDK build boundary.
+Bounded FAT32 adapter and Native filesystem worker.
 
-## Write progress and storage errors
+Adapts the vendored rust-fatfs implementation to bounded block access and the `lib-fs-
+service` worker contract. The volume owns media, operation budgets, caches and coalesced
+writes; VFS owns namespace identities and open-file leases.
 
-A write reports the input prefix accepted by the filesystem. If allocation runs
-out after a prefix, the reply is a short count; retry only the remaining suffix.
-Append positions advance by that count, not by the original request length.
-Zero filling before the requested offset is not input progress. A failed gap
-extension may leave zero-filled bytes even when no input was accepted.
+See the [implementation entry](docs/fat.md) and [component declaration](component.json)
+for the public interfaces, build dependencies and delivered artifacts.
 
-Accepted bytes are not a durability guarantee. A later buffered-write or device
-completion failure does not erase a known count. The volume remains poisoned,
-rejects further operations and reports failure on sync. All accepted asynchronous
-requests are drained before their source window is released. If the failing
-transfer itself has indeterminate effects, its bytes are not counted; an error
-does not promise rollback or make blindly replaying an append safe.
+## Boundaries
 
-## Workspace tests
+Filesystem operations require a sleepable mutex. Upstream objects stay inside the
+adapter because destructors can perform I/O; failures poison the volume before unsafe
+reuse. FAT is not a journaled filesystem, and accepted writes are not a durability
+guarantee.
 
-Use the [HypeR workspace](https://github.com/HypeR-Proj/HypeR) to resolve dependencies:
+## Build and test
+
+Use this checkout inside the [repo-managed workspace](https://github.com/HypeR-Proj/HypeR).
+From this repository directory:
 
 ```sh
-python3 project.py test fs-fat
+make
+make test
 ```
 
-Paths in the documentation are relative to the repo-managed workspace root.
-Edit this repository and prepare the workspace again before building.
+An absolute `OUT=/path/to/out` selects a shared output directory. The module
+entry delegates to build/system, which prepares the installed SDK and declared
+dependencies. Native binaries require HypeR; host module checks cover the tests
+selected by component.json. A standalone clone does not contain the workspace’s
+other source repositories or Native SDK.
