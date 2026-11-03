@@ -657,6 +657,10 @@ impl<D: BlockDevice> FatVolume<D> {
         Ok(builder.finish())
     }
 
+    /// Return the accepted input prefix, including after a later drain failure.
+    /// This is not a durability promise: sync reports storage failures, and a
+    /// poisoned volume rejects further operations. Zero filling before offset
+    /// never counts as caller input; an error may still have extended that gap.
     pub fn write_at(&mut self, path: &str, offset: u64, input: &[u8]) -> Result<usize, Error> {
         validate_path(path)?;
         self.writable()?;
@@ -669,7 +673,8 @@ impl<D: BlockDevice> FatVolume<D> {
         {
             return Err(Error::InvalidInput);
         }
-        self.run(|fs| {
+        let mut accepted = 0;
+        let result = self.run(|fs| {
             let mut file = fs.root_dir().open_file(path).map_err(Error::from)?;
             let position = file.seek(SeekFrom::Start(offset)).map_err(Error::from)?;
             let mut gap = offset - position;
@@ -678,10 +683,24 @@ impl<D: BlockDevice> FatVolume<D> {
                 file.write_all(&ZERO_SECTOR[..n]).map_err(Error::from)?;
                 gap -= n as u64;
             }
-            file.write_all(input).map_err(Error::from)?;
+            while accepted < input.len() {
+                let count = file.write(&input[accepted..]).map_err(Error::from)?;
+                if count == 0 {
+                    return Err(Error::Block(BlockError::Io));
+                }
+                accepted += count;
+            }
             file.flush().map_err(Error::from)?;
-            Ok(input.len())
-        })
+            Ok(())
+        });
+        // run still drains accepted asynchronous writes and latches media
+        // failure before releasing their owners. Its final error must not erase
+        // the known prefix or encourage replaying it in a later append.
+        if accepted != 0 {
+            Ok(accepted)
+        } else {
+            result.map(|()| 0)
+        }
     }
     /// Preserve the kernel-owned readonly source through FAT's cluster walk.
     /// The ordinary operation boundary drains all accepted writes before this
