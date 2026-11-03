@@ -5,8 +5,21 @@ SPDX-License-Identifier: Apache-2.0
 
 # fs-fat
 
-A HypeR component. See [HypeR](https://github.com/HypeR-Proj/HypeR) for
-workspace setup and the installed SDK build boundary.
+Bounded FAT32 adapter and Native filesystem worker.
+
+Adapts the vendored rust-fatfs implementation to bounded block access and the `lib-fs-
+service` worker contract. The volume owns media, operation budgets, caches and coalesced
+writes; VFS owns namespace identities and open-file leases.
+
+See the [implementation entry](docs/fat.md) and [component declaration](component.json)
+for the public interfaces, build dependencies and delivered artifacts.
+
+## Boundaries
+
+Filesystem operations require a sleepable mutex. Upstream objects stay inside the
+adapter because destructors can perform I/O; failures poison the volume before unsafe
+reuse. FAT is not a journaled filesystem, and accepted writes are not a durability
+guarantee.
 
 ## Write progress and storage errors
 
@@ -23,13 +36,18 @@ requests are drained before their source window is released. If the failing
 transfer itself has indeterminate effects, its bytes are not counted; an error
 does not promise rollback or make blindly replaying an append safe.
 
-## Workspace tests
+## Build and test
 
-Use the [HypeR workspace](https://github.com/HypeR-Proj/HypeR) to resolve dependencies:
+Use this checkout inside the [repo-managed workspace](https://github.com/HypeR-Proj/HypeR).
+From this repository directory:
 
 ```sh
-python3 project.py test fs-fat
+make
+make test
 ```
 
-Paths in the documentation are relative to the repo-managed workspace root.
-Edit this repository and prepare the workspace again before building.
+An absolute `OUT=/path/to/out` selects a shared output directory. The module
+entry delegates to build/system, which prepares the installed SDK and declared
+dependencies. Native binaries require HypeR; host module checks cover the tests
+selected by component.json. A standalone clone does not contain the workspace’s
+other source repositories or Native SDK.
