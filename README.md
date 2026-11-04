@@ -51,3 +51,13 @@ entry delegates to build/system, which prepares the installed SDK and declared
 dependencies. Native binaries require HypeR; host module checks cover the tests
 selected by component.json. A standalone clone does not contain the workspace’s
 other source repositories or Native SDK.
+
+## Synchronous mutation policy
+
+The shared service defaults FAT to synchronous mutations. Write, create, remove,
+rename, resize and timestamp changes synchronize filesystem metadata and complete
+the device flush before returning. Independent block transfers can still overlap
+inside that operation; there is no delayed dirty-page writer. Accepted write
+prefixes are preserved if the final fence fails, and that error remains visible
+through subsequent requests/sync. This does not make interrupted FAT metadata
+updates transactional. The independent bootstrap worker follows the same policy.
