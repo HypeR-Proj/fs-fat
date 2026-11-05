@@ -21,6 +21,10 @@ mod queue_probe;
 struct Fat(FatVolume<Device>);
 
 impl Volume for Fat {
+    fn capabilities(&self) -> protocol::Capabilities {
+        protocol::Capabilities::READ_EXTENTS
+    }
+
     fn stat(&mut self, path: &str) -> Result<Entry, Error> {
         self.0.stat(path).map(metadata).map_err(map_error)
     }
