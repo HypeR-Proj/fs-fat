@@ -9,14 +9,10 @@ use hyper_filesystem::{
 };
 use hyper_fs_fat::{FatVolume, block::Error as BlockError};
 use hyper_fs_service::Volume;
-use hyper_os::block::{BlockQueue, NativeBlock, QueueConfig};
+use hyper_os::block::BlockQueue;
 
 mod device;
 use device::Device;
-
-#[cfg(feature = "block-queue-test")]
-#[path = "../../../tests/app/block-queue-probe.rs"]
-mod queue_probe;
 
 struct Fat(FatVolume<Device>);
 
@@ -167,27 +163,11 @@ fn run() -> Result<(), String> {
         _ => return Err("invalid volume access mode".into()),
     };
 
-    let (block, adopted) = if std::env::args().nth(3).as_deref() == Some("--adopt") {
-        let (block, state) = hyper_fs_service::adopt(&mut startup)?;
-        (block, Some(state))
+    let adopted = if std::env::args().nth(3).as_deref() == Some("--adopt") {
+        Some(hyper_fs_service::adopt(&mut startup)?)
     } else {
-        (
-            NativeBlock::from_handle(
-                startup
-                    .take(hyper_service::filesystem::BLOCK)
-                    .map_err(show)?,
-            ),
-            None,
-        )
+        None
     };
-
-    #[cfg(feature = "block-queue-test")]
-    queue_probe::run(
-        &block,
-        sectors,
-        readonly,
-        startup.borrow(hyper_os::startup::ROOT_VMAR).map_err(show)?,
-    )?;
 
     let queue = match adopted.as_ref() {
         Some(state) => BlockQueue::from_handle(
@@ -197,12 +177,15 @@ fn run() -> Result<(), String> {
                 .duplicate(hyper_service::filesystem::QUEUE_RIGHTS)
                 .map_err(show)?,
         ),
-        None => block.create_queue(QueueConfig::default()).map_err(show)?,
+        None => BlockQueue::from_handle(
+            startup
+                .take(hyper_service::filesystem::QUEUE)
+                .map_err(show)?,
+        ),
     };
 
     let volume = FatVolume::mount_with_clock(
         Device::new(
-            block,
             sectors,
             readonly,
             BlockQueue::from_handle(
@@ -223,7 +206,8 @@ fn run() -> Result<(), String> {
         None => hyper_fs_service::serve(&mut startup, &mut volume, queue)?,
     };
     let device = volume.0.into_device().map_err(show)?;
-    hyper_fs_service::return_block(completion, device.into_block().map_err(show)?)
+    device.close().map_err(show)?;
+    hyper_fs_service::finish(completion)
 }
 
 fn show(error: impl core::fmt::Debug) -> String {
