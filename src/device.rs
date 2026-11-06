@@ -7,13 +7,12 @@
 //! source is directly visible to device DMA.
 
 use hyper_fs_fat::block::{self, BlockDevice, Error, WriteRequest};
-use hyper_os::block::{BlockQueue, NativeBlock, Ticket, WindowWrite};
+use hyper_os::block::{BlockQueue, Ticket, WindowWrite};
 
 const REQUESTS: usize = 16;
 const TRANSFER_BYTES: usize = block::WRITE_BATCH_BYTES;
 
 pub(super) struct Device {
-    block: NativeBlock,
     queue: Option<BlockQueue>,
     pending: [Option<Ticket>; REQUESTS],
     sectors: u64,
@@ -39,14 +38,8 @@ impl Source {
 }
 
 impl Device {
-    pub(super) fn new(
-        block: NativeBlock,
-        sectors: u64,
-        readonly: bool,
-        queue: BlockQueue,
-    ) -> Result<Self, Error> {
+    pub(super) fn new(sectors: u64, readonly: bool, queue: BlockQueue) -> Result<Self, Error> {
         Ok(Self {
-            block,
             queue: Some(queue),
             pending: [None; REQUESTS],
             sectors,
@@ -62,12 +55,11 @@ impl Device {
         })
     }
 
-    /// End the derived queue before handing the original volume capability to
-    /// another worker. No accepted write may cross that ownership boundary.
-    pub(super) fn into_block(mut self) -> Result<NativeBlock, Error> {
+    /// Drain adapter-owned writes before acknowledging worker shutdown.
+    pub(super) fn close(mut self) -> Result<(), Error> {
         self.complete_writes()?;
         drop(self.queue.take());
-        Ok(self.block)
+        Ok(())
     }
 
     fn queue(&self) -> Result<&BlockQueue, Error> {
